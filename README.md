@@ -46,7 +46,7 @@ its own trajectory and having the teacher evaluate that same trajectory:
                               ▼
                     ┌────────────────────┐
                     │ Teacher            │
-                    │ Qwen2.5-1.5B      │
+                    │ Qwen2.5-1.5B       │
                     └─────────┬──────────┘
                               │
                        top-K logits
