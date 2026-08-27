@@ -55,8 +55,8 @@ def pred(text):
 # ---------------------------------------------------------------- models
 
 tok = AutoTokenizer.from_pretrained(STUDENT_ID, padding_side="left")
-student = AutoModelForCausalLM.from_pretrained(STUDENT_ID, torch_dtype=DTYPE).to(DEVICE)
-teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, torch_dtype=DTYPE).to(DEVICE)
+student = AutoModelForCausalLM.from_pretrained(STUDENT_ID, torch_dtype=DTYPE, attn_implementation="eager").to(DEVICE)
+teacher = AutoModelForCausalLM.from_pretrained(TEACHER_ID, torch_dtype=DTYPE, attn_implementation="eager").to(DEVICE)
 teacher.eval()
 for p in teacher.parameters():
     p.requires_grad_(False)
