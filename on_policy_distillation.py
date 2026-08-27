@@ -35,7 +35,7 @@ torch.manual_seed(SEED)
 
 # ---------------------------------------------------------------- data
 
-ds = load_dataset("gsm8k", "main")
+ds = load_dataset("openai/gsm8k", "main")
 train_q = [ex["question"] for ex in ds["train"]]
 test = [(ex["question"], ex["answer"]) for ex in ds["test"]][:EVAL_N]
 
