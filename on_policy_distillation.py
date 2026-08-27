@@ -1,6 +1,7 @@
 """
+On-policy distillation (OPD) on a single free-tier Colab GPU (T4, 16GB).
+
 Student: Qwen2.5-0.5B-Instruct   Teacher: Qwen2.5-1.5B-Instruct   Task: GSM8K
-Same tokenizer family on purpose -- cross-tokenizer OPD is a separate project.
 
 The loop:
   1. student samples a completion for a prompt          (no grad)
@@ -8,12 +9,10 @@ The loop:
   3. per-token truncated reverse KL(student || teacher) (grad)
   4. backprop
 
-There is no REINFORCE and no credit assignment here. The discount factor is
-zero, so supervision is local to each token and the loss is differentiable
-directly. That is the whole reason OPD is cheaper than RL.
+There is no REINFORCE and no credit assignment. The discount factor is zero, so
+supervision is local to each token and the loss is differentiable directly.
 
-RUN THIS IN A FRESH RUNTIME. A device-side assert poisons the CUDA context and
-every later GPU call in the session fails regardless of what you fix.
+RUN IN A FRESH RUNTIME.
 
 Setup:
     import os
@@ -39,34 +38,26 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 STUDENT_ID = "Qwen/Qwen2.5-0.5B-Instruct"
 TEACHER_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 
-STEPS = 150          # small batch -> noisier steps, so run more of them
-BATCH = 2            # prompts per step
-MAX_NEW = 192        # completion cap
-TOPK = 64            # truncate reverse KL to the teacher's top-K support
-LR = 1e-5
-TEMP = 1.0           # sample at 1.0. Low temperature collapses the on-policy
-                     # distribution and you end up doing off-policy SFT.
-TOP_K_SAMPLE = 50    # sampling guard against the noisy logit tail
+STEPS = 150
+BATCH = 2
+MAX_NEW = 192
+TOPK = 64
+LR = 1e-6            # was 1e-5. Batch 2 gives noisy gradients; 1e-5 on top of
+                     # that walked the model off a cliff by step 50.
+TEMP = 1.0
+TOP_K_SAMPLE = 50
 TOP_P_SAMPLE = 0.95
-EVAL_EVERY = 50
+REP_PENALTY = 1.15   # discourages rollouts degenerating into repeats
+SKIP_GRAD_NORM = 100.0   # was 10.0 — normal range here is 20-32
+GRAD_CLIP = 1.0          # was 0.5 — clipping to 0.5 against a norm of ~25. shrinks every update 50x, which would train nothing
+EVAL_EVERY = 10      # tighter grid: catch collapse at 25, not at 50
 EVAL_N = 100
-EVAL_BATCH = 8       # eval is no-grad, so it can use a bigger batch than train
+EVAL_BATCH = 8
 SEED = 0
 
 DEVICE = "cuda"
-
-# DTYPES -- this is the fix for the device-side assert.
-#
-# T4 is Turing: no bf16. Qwen2.5-0.5B in fp16 overflows: logits go inf/NaN,
-# softmax yields invalid probabilities, torch.multinomial asserts. Greedy
-# decoding hides this (argmax over garbage still returns an index), which is why
-# eval "worked" while sampling crashed.
-#
-# Student in fp32: it is sampled from and backpropped through.
-# Teacher in fp16: forward passes only, never feeds multinomial. Half the memory
-# for no sampling risk -- but it CAN still emit inf, so opd_loss sanitizes it.
-S_DTYPE = torch.float32
-T_DTYPE = torch.float16
+S_DTYPE = torch.float32   # student: sampled from + backpropped through
+T_DTYPE = torch.float16   # teacher: forward passes only
 
 SYS = "Solve the math problem. Reason step by step, then give the final answer as: #### <number>"
 
@@ -88,7 +79,7 @@ def pred(text):
     m = re.findall(r"####\s*(-?[\d,]+)", text)
     if m:
         return m[-1].strip().replace(",", "")
-    m = re.findall(r"(-?[\d,]+\.?\d*)", text)  # fallback: last number
+    m = re.findall(r"(-?[\d,]+\.?\d*)", text)
     return m[-1].strip().replace(",", "") if m else None
 
 
@@ -106,32 +97,49 @@ for p in teacher.parameters():
 assert student.config.vocab_size == teacher.config.vocab_size, "tokenizer mismatch"
 
 PAD = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-# If PAD == EOS, generated EOS tokens get masked out of the loss. Qwen2.5 sets
-# them separately (<|endoftext|> vs <|im_end|>), so this should hold.
 assert PAD != tok.eos_token_id, "pad == eos: completion mask will drop EOS tokens"
 
-# MEMORY. On a 16GB T4 the naive setup lands at ~13.6GB and OOMs on activations:
-#   student fp32 weights 2.0 + grads 2.0 + AdamW moments 4.0 + teacher 3.1
-# The optimizer is the biggest single line and the easiest to shrink.
-student.gradient_checkpointing_enable()   # ~30% slower, large activation saving
-student.config.use_cache = False          # incompatible with checkpointing
+# ---- FIX 1: freeze the embedding matrix.
+#
+# Qwen2.5-0.5B ties input embeddings to the output head, so every gradient into
+# the lm_head writes straight into the token embedding table. Corrupt that and
+# the model loses its token->vector mapping entirely -- the symptom is output
+# that dumps vocabulary in sorted order, which is what happened on the last run.
+#
+# The transformer body has ample capacity to fit the teacher without touching
+# the embedding. Freezing it also removes the largest single parameter block
+# from the optimizer, which helps memory.
+if student.config.tie_word_embeddings:
+    student.get_input_embeddings().weight.requires_grad_(False)
+    print("tied embeddings detected -> frozen")
+
+# ---- FIX 2: non-reentrant checkpointing.
+#
+# The default (reentrant) implementation can silently produce WRONG gradients.
+# Wrong gradients into a tied embedding is a fast route to a destroyed model.
+student.gradient_checkpointing_enable(
+    gradient_checkpointing_kwargs={"use_reentrant": False})
+student.config.use_cache = False
+student.enable_input_require_grads()   # needed for non-reentrant checkpointing
+
+trainable = [p for p in student.parameters() if p.requires_grad]
+print(f"trainable params: {sum(p.numel() for p in trainable)/1e6:.0f}M "
+      f"of {sum(p.numel() for p in student.parameters())/1e6:.0f}M")
 
 try:
     import bitsandbytes as bnb
-    opt = bnb.optim.AdamW8bit(student.parameters(), lr=LR)   # 4.0GB -> 1.0GB
+    opt = bnb.optim.AdamW8bit(trainable, lr=LR, weight_decay=0.0)
     print("using AdamW8bit")
 except ImportError:
-    opt = torch.optim.AdamW(student.parameters(), lr=LR)
-    print("bitsandbytes missing -- falling back to fp32 AdamW, expect OOM")
+    opt = torch.optim.AdamW(trainable, lr=LR, weight_decay=0.0)
+    print("bitsandbytes missing -- using fp32 AdamW")
 
 
 def prompts(questions):
     texts = [
         tok.apply_chat_template(
             [{"role": "system", "content": SYS}, {"role": "user", "content": q}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
+            tokenize=False, add_generation_prompt=True)
         for q in questions
     ]
     return tok(texts, return_tensors="pt", padding=True, truncation=True,
@@ -144,38 +152,27 @@ def prompts(questions):
 def opd_loss(student_logits, teacher_logits, completion_mask, k=TOPK):
     """Truncated per-token reverse KL on the student's own tokens.
 
-    ALIGNMENT: logits at position i predict the token at position i+1. Getting
-    this shift wrong is the single most common bug in distillation code and it
-    fails SILENTLY -- loss goes down, model gets worse. Sanity check below.
+    ALIGNMENT: logits at position i predict the token at position i+1.
     """
     s = student_logits[:, :-1, :]
-    # The fp16 teacher can emit inf on long sequences; that propagates straight
-    # into a non-finite loss. Clamp rather than let it poison AdamW's moments.
     t = teacher_logits[:, :-1, :].nan_to_num(nan=0.0, posinf=1e4, neginf=-1e4)
     m = completion_mask[:, 1:].float()
 
-    # Restrict to the teacher's top-K support, then renormalize both sides over
-    # that subset. Keeps memory at [B, L, 64] instead of [B, L, 151936].
     idx = t.topk(k, dim=-1).indices
     ls = F.log_softmax(s.gather(-1, idx).float(), dim=-1)
     lt = F.log_softmax(t.gather(-1, idx).float(), dim=-1)
 
-    kl = (ls.exp() * (ls - lt)).sum(-1)          # [B, L-1]
+    kl = (ls.exp() * (ls - lt)).sum(-1)
     return (kl * m).sum() / m.sum().clamp(min=1)
 
 
 def _sanity_check():
-    """Two checks, both cheap, both catch bugs that fail silently otherwise."""
     b = prompts(train_q[:2])
     with torch.no_grad():
         lg = student(**b).logits
-
-    # 1. numerics: if the logits are broken, nothing downstream matters
     assert not torch.isnan(lg).any(), "NaN in student logits"
     assert not torch.isinf(lg).any(), "inf in student logits"
     print(f"logit range ok (max |logit| = {lg.abs().max().item():.1f})")
-
-    # 2. alignment: a model's KL against itself must be zero
     v = opd_loss(lg, lg.clone(), b["attention_mask"]).item()
     assert abs(v) < 1e-4, f"alignment/loss bug: self-KL = {v}"
     print(f"sanity check passed (self-KL = {v:.2e})")
@@ -186,27 +183,21 @@ def _sanity_check():
 
 @torch.no_grad()
 def rollout(questions):
-    """Sample from the CURRENT student policy. This is the 'on-policy' part."""
     student.eval()
-    student.config.use_cache = True     # KV cache is a big speedup for generate
+    student.config.use_cache = True
     b = prompts(questions)
     plen = b["input_ids"].shape[1]
     out = student.generate(
-        **b,
-        max_new_tokens=MAX_NEW,
-        do_sample=True,
-        temperature=TEMP,
-        top_p=TOP_P_SAMPLE,
-        top_k=TOP_K_SAMPLE,
-        pad_token_id=PAD,
+        **b, max_new_tokens=MAX_NEW, do_sample=True, temperature=TEMP,
+        top_p=TOP_P_SAMPLE, top_k=TOP_K_SAMPLE,
+        repetition_penalty=REP_PENALTY, pad_token_id=PAD,
     )
-    student.config.use_cache = False    # back off for checkpointed training
+    student.config.use_cache = False
     student.train()
 
     ids = out
     attn = (ids != PAD).long()
     attn[:, :plen] = b["attention_mask"]
-    # supervise only the tokens the student generated, not the prompt
     comp = torch.zeros_like(attn)
     comp[:, plen:] = attn[:, plen:]
     return ids, attn, comp
@@ -216,30 +207,37 @@ def rollout(questions):
 
 
 @torch.no_grad()
+def sample_output():
+    """Print one greedy completion. A number tells you the model got worse;
+    this tells you HOW -- repetition loop, gibberish, or fluent-but-wrong are
+    three different problems with three different fixes."""
+    student.eval(); student.config.use_cache = True
+    b = prompts(train_q[:1])
+    out = student.generate(**b, max_new_tokens=80, do_sample=False, pad_token_id=PAD)
+    txt = tok.decode(out[0, b["input_ids"].shape[1]:], skip_special_tokens=True)
+    student.config.use_cache = False; student.train()
+    return txt.replace("\n", " ")[:160]
+
+
+@torch.no_grad()
 def evaluate():
     student.eval()
     student.config.use_cache = True
-    correct = 0
-    lengths = []
+    correct, lengths = 0, []
     for i in range(0, len(test), EVAL_BATCH):
         chunk = test[i:i + EVAL_BATCH]
         b = prompts([q for q, _ in chunk])
-        out = student.generate(
-            **b, max_new_tokens=MAX_NEW, do_sample=False, pad_token_id=PAD,
-        )
+        out = student.generate(**b, max_new_tokens=MAX_NEW, do_sample=False,
+                               pad_token_id=PAD)
         gen = out[:, b["input_ids"].shape[1]:]
         for row, (_, a) in zip(gen, chunk):
             text = tok.decode(row, skip_special_tokens=True)
-            # count REAL tokens, not batch padding. len(row) measures the
-            # longest sequence in the batch and makes the metric meaningless.
-            lengths.append(int((row != PAD).sum()))
+            lengths.append(int((row != PAD).sum()))   # real tokens, not padding
             if pred(text) == gold(a):
                 correct += 1
     student.config.use_cache = False
     student.train()
     torch.cuda.empty_cache()
-    # Runaway length is a documented OPD failure mode, and a length plot is
-    # worth more on a resume than an accuracy plot alone.
     return correct / len(test), sum(lengths) / len(lengths)
 
 
@@ -247,10 +245,11 @@ def evaluate():
 
 _sanity_check()
 
-log = {"step": [], "acc": [], "len": [], "loss": []}
+log = {"step": [], "acc": [], "len": [], "loss": [], "gnorm": []}
 acc, mean_len = evaluate()
 log["step"].append(0); log["acc"].append(acc); log["len"].append(mean_len)
 print(f"step 0  |  acc {acc:.3f}  len {mean_len:.0f}")
+print(f"  sample: {sample_output()}\n")
 
 student.train()
 skipped = 0
@@ -261,25 +260,32 @@ for step in range(1, STEPS + 1):
     with torch.no_grad():
         t_logits = teacher(input_ids=ids, attention_mask=attn).logits
     s_logits = student(input_ids=ids, attention_mask=attn).logits
-
     loss = opd_loss(s_logits, t_logits, comp)
 
-    # A single NaN step corrupts every weight via AdamW's moments. Skip and
-    # count instead -- if skips climb, the run is not trustworthy.
     if not torch.isfinite(loss):
         skipped += 1
-        print(f"step {step}: non-finite loss, skipped ({skipped} total)")
         opt.zero_grad(set_to_none=True)
-        del s_logits, t_logits
-        torch.cuda.empty_cache()
+        del s_logits, t_logits; torch.cuda.empty_cache()
         continue
 
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+
+    # ---- FIX 3: skip on gradient spike, and LOG the norm.
+    # A single outsized update is what destroys a model. Clipping alone rescales
+    # a bad direction; it does not reject it. Logging the norm means the next
+    # failure is diagnosable from the curve instead of from guesswork.
+    gnorm = torch.nn.utils.clip_grad_norm_(trainable, GRAD_CLIP).item()
+    if gnorm > SKIP_GRAD_NORM:
+        skipped += 1
+        print(f"step {step}: grad norm {gnorm:.1f} > {SKIP_GRAD_NORM}, skipped")
+        opt.zero_grad(set_to_none=True)
+        del s_logits, t_logits; torch.cuda.empty_cache()
+        continue
+
     opt.step()
     opt.zero_grad(set_to_none=True)
 
-    log["loss"].append(loss.item())
+    log["loss"].append(loss.item()); log["gnorm"].append(gnorm)
     del s_logits, t_logits
     if step % 10 == 0:
         torch.cuda.empty_cache()
@@ -287,17 +293,25 @@ for step in range(1, STEPS + 1):
     if step % EVAL_EVERY == 0:
         acc, mean_len = evaluate()
         log["step"].append(step); log["acc"].append(acc); log["len"].append(mean_len)
-        print(f"step {step}  |  KL {loss.item():.4f}  acc {acc:.3f}  len {mean_len:.0f}")
-        student.save_pretrained("/content/opd_ckpt")   # Colab disconnects. Save.
-        tok.save_pretrained("/content/opd_ckpt")
+        print(f"step {step}  |  KL {loss.item():.4f}  |g| {gnorm:.2f}  "
+              f"acc {acc:.3f}  len {mean_len:.0f}")
+        print(f"  sample: {sample_output()}\n")
+        student.save_pretrained(f"/content/opd_ckpt_{step}")
+        tok.save_pretrained(f"/content/opd_ckpt_{step}")   # keep per-step
+                                                            # checkpoints so a
+                                                            # collapse doesn't
+                                                            # overwrite a good one
 
 log["skipped_steps"] = skipped
 json.dump(log, open("opd_log.json", "w"))
 
-fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+fig, ax = plt.subplots(1, 3, figsize=(14, 4))
 ax[0].plot(log["step"], log["acc"], marker="o")
 ax[0].set_xlabel("OPD step"); ax[0].set_ylabel("GSM8K accuracy")
 ax[1].plot(log["step"], log["len"], marker="o", color="crimson")
+ax[1].axhline(MAX_NEW, ls="--", c="gray", lw=1)
 ax[1].set_xlabel("OPD step"); ax[1].set_ylabel("mean completion length")
+ax[2].plot(log["gnorm"], lw=0.8, color="darkgreen")
+ax[2].set_xlabel("OPD step"); ax[2].set_ylabel("grad norm (pre-clip)")
 plt.tight_layout(); plt.savefig("opd_results.png", dpi=150)
-print(f"done ({skipped}/{STEPS} steps skipped) ->  opd_results.png,  opd_log.json")
+print(f"done ({skipped}/{STEPS} skipped) -> opd_results.png, opd_log.json")
