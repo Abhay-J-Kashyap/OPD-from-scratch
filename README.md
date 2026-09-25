@@ -4,6 +4,8 @@ A from-scratch implementation of on-policy distillation (OPD),
 distilling Qwen2.5-1.5B-Instruct into Qwen2.5-0.5B-Instruct on GSM8K,
 trained end-to-end on one free-tier Colab T4.
 
+Download the model here on HF: https://huggingface.co/Abhay2310/qwen2.5-0.5b-opd-gsm8k
+
 The loss is written directly in PyTorch rather than configured through a
 trainer, because the point of the project was to understand the
 objective, its practical constraints, and its failure modes rather than
